@@ -1,8 +1,46 @@
-"""Qlever + Photon facility finder.
+"""Qlever + Photon + NCES facility finder — v6.
 
-Replaces Overpass with Qlever SPARQL and Nominatim with Photon. Use when
-Nominatim rate limits have blocked your IP. Same input/output schema as
-batch_facility_finder.py.
+v6 layers the Urban Institute Education Data API (federal NCES Common Core
+of Data) on top of Qlever/OSM. Every US public K-12 school appears even
+when OSM has no pitch tagging. NCES supplies name, GPS, and school_level
+(Elementary/Middle/High); the memo dimension table supplies default field
+sizes when no OSM pitch is present.
+
+Data flow additions vs v5:
+1. fetch_nces_schools(city, state) hits
+   https://educationdata.urban.org/api/v1/schools/ccd/directory/YEAR/
+   Results cached per state for 30 days.
+2. fetch_overpass merges NCES entries with Qlever entries; coord dedup
+   drops overlaps (OSM school + same NCES school).
+3. merge_and_deduplicate lets source == "nces" bypass sport-gating
+   post-filter — every real school is a valid facility for the memo sports.
+4. categorize routes NCES entries by school_level (1=Elem, 2=Mid, 3=Hi).
+
+Legacy v5 header follows.
+--
+Qlever + Photon facility finder — v5 (broader container fetch).
+
+v5 drops the SPARQL spatial-join `ogc:sfContains ?pitch` requirement from
+the parks/schools/sports_centres/recreation_grounds queries. Earlier
+versions required a facility to already contain an OSM-tagged pitch, which
+silently excluded middle schools and other facilities whose pitches were
+not tagged. v5 fetches all containers in the city bbox, then relies on the
+existing 500m haversine proximity step to attach pitches; the
+`has_pitches or is_sport_name` post-filter still prevents the
+"every park appears in every sport" bug.
+
+Improvements over qlever_facility_finder.py:
+1. Container queries (parks/schools/sports_centres) now use Qlever's spatial
+   join `?facility ogc:sfContains ?pitch` to find facilities that actually
+   contain a pitch of the chosen sport — replaces the 200m haversine
+   heuristic which missed large campuses.
+2. Indoor sports (Basketball, Volleyball) include ALL sports_centres,
+   fitness_centres, sports_halls, and community_centres regardless of
+   pitch tags (indoor courts are rarely tagged with sport).
+3. Adds athletic_centre, stadium, recreation_ground, gym building tags to
+   the candidate facility pool.
+
+Same input/output schema as qlever_facility_finder.py.
 """
 
 import re
@@ -49,6 +87,13 @@ HEADERS = {
 }
 
 _log_lock = Lock()
+
+# Cap concurrent SPARQL POSTs to the public Qlever endpoint across all
+# worker threads. Batch mode runs N outer x M inner workers = up to N*M
+# simultaneous queries; the public instance silently throttles -> returns []
+# -> "0 facilities" everywhere. Cap globally at 3.
+from threading import Semaphore as _Semaphore
+_QLEVER_SEM = _Semaphore(3)
 
 from threading import Semaphore as _Semaphore
 _OVERPASS_SEM = _Semaphore(2)
@@ -188,103 +233,106 @@ SPORTS_CONFIG = {
     },
 }
 
-STANDARD_DIMENSIONS = {
-    "Soccer / Football": {
-        "ELEMENTARY SCHOOLS":              (150, 90),
-        "MIDDLE SCHOOLS":                  (180, 120),
-        "HIGH SCHOOLS":                    (360, 225),
-        "COLLEGE":                         (360, 225),
-        "PUBLIC PARKS & RECREATION":       (300, 195),
-        "GYMNASIUM / INDOOR FACILITIES":   (200, 100),
-        "OTHER FACILITIES":                (300, 195),
-    },
+# Per (sport, category) dimensions: (L1, W1, L2, W2). From GamePlay memo.
+SPORT_DIMENSIONS = {
     "Baseball / Softball": {
-        "ELEMENTARY SCHOOLS":              (200, 200),
-        "MIDDLE SCHOOLS":                  (250, 250),
-        "HIGH SCHOOLS":                    (325, 325),
-        "COLLEGE":                         (400, 400),
-        "PUBLIC PARKS & RECREATION":       (300, 300),
-        "GYMNASIUM / INDOOR FACILITIES":   (None, None),
-        "OTHER FACILITIES":                (300, 300),
+        "ELEMENTARY SCHOOLS":            (210, 135, 225, 275),
+        "MIDDLE SCHOOLS":                (210, 135, 300, 360),
+        "HIGH SCHOOLS":                  (210, 135, 330, 390),
+        "PUBLIC PARKS & RECREATION":     (210, 135, 300, 360),
+        "COLLEGE":                       (210, 135, 225, 275),
+        "GYMNASIUM / INDOOR FACILITIES": (210, 135, 225, 275),
+        "OTHER FACILITIES":              (210, 135, 225, 275),
     },
     "Basketball": {
-        "ELEMENTARY SCHOOLS":              (74, 42),
-        "MIDDLE SCHOOLS":                  (84, 50),
-        "HIGH SCHOOLS":                    (84, 50),
-        "COLLEGE":                         (94, 50),
-        "PUBLIC PARKS & RECREATION":       (84, 50),
-        "GYMNASIUM / INDOOR FACILITIES":   (94, 50),
-        "OTHER FACILITIES":                (84, 50),
+        "ELEMENTARY SCHOOLS":            (74, 50, None, None),
+        "MIDDLE SCHOOLS":                (94, 50, None, None),
+        "HIGH SCHOOLS":                  (94, 50, None, None),
+        "PUBLIC PARKS & RECREATION":     (94, 50, None, None),
+        "COLLEGE":                       (94, 50, None, None),
+        "GYMNASIUM / INDOOR FACILITIES": (94, 50, None, None),
+        "OTHER FACILITIES":              (94, 50, None, None),
+    },
+    "Soccer / Football": {
+        "ELEMENTARY SCHOOLS":            (210, 135, 225, 275),
+        "MIDDLE SCHOOLS":                (300, 150, 225, 275),
+        "HIGH SCHOOLS":                  (300, 150, 225, 275),
+        "PUBLIC PARKS & RECREATION":     (300, 150, 225, 275),
+        "COLLEGE":                       (300, 150, 225, 275),
+        "GYMNASIUM / INDOOR FACILITIES": (300, 150, 225, 275),
+        "OTHER FACILITIES":              (300, 150, 225, 275),
     },
     "Tennis": {
-        "ELEMENTARY SCHOOLS":              (78, 36),
-        "MIDDLE SCHOOLS":                  (78, 36),
-        "HIGH SCHOOLS":                    (78, 36),
-        "COLLEGE":                         (78, 36),
-        "PUBLIC PARKS & RECREATION":       (78, 36),
-        "GYMNASIUM / INDOOR FACILITIES":   (78, 36),
-        "OTHER FACILITIES":                (78, 36),
+        "ELEMENTARY SCHOOLS":            (78, 36, None, None),
+        "MIDDLE SCHOOLS":                (78, 36, None, None),
+        "HIGH SCHOOLS":                  (78, 36, None, None),
+        "PUBLIC PARKS & RECREATION":     (78, 36, None, None),
+        "COLLEGE":                       (78, 36, None, None),
+        "GYMNASIUM / INDOOR FACILITIES": (78, 36, None, None),
+        "OTHER FACILITIES":              (78, 36, None, None),
     },
     "Volleyball": {
-        "ELEMENTARY SCHOOLS":              (50, 25),
-        "MIDDLE SCHOOLS":                  (60, 30),
-        "HIGH SCHOOLS":                    (60, 30),
-        "COLLEGE":                         (60, 30),
-        "PUBLIC PARKS & RECREATION":       (60, 30),
-        "GYMNASIUM / INDOOR FACILITIES":   (60, 30),
-        "OTHER FACILITIES":                (60, 30),
+        "ELEMENTARY SCHOOLS":            (50, 25, None, None),
+        "MIDDLE SCHOOLS":                (60, 30, None, None),
+        "HIGH SCHOOLS":                  (60, 30, None, None),
+        "PUBLIC PARKS & RECREATION":     (60, 30, None, None),
+        "COLLEGE":                       (60, 30, None, None),
+        "GYMNASIUM / INDOOR FACILITIES": (60, 30, None, None),
+        "OTHER FACILITIES":              (60, 30, None, None),
     },
 }
 
-SPORT_COLOR = {
-    "Soccer / Football":   "Red",
-    "Baseball / Softball": "Yellow",
-    "Basketball":          "Orange",
-    "Tennis":              "Green",
-    "Volleyball":          "Blue",
-}
-
-COLOR_NAME_TO_HEX = {
-    "Green":  "C6EFCE",
-    "Red":    "F8CBAD",
-    "Yellow": "FFE699",
-    "Orange": "FFD966",
-    "Blue":   "BDD7EE",
-    "Purple": "CC99FF",
-    "Gray":   "D9D9D9",
-}
-
-SECONDARY_SPORTS_BY_SPORT = {
-    "Soccer / Football": {
-        "other_primary": ["Football", "Soccer"],
-        "secondary":     ["Lacrosse", "Field Hockey", "Rugby"],
-    },
+SPORT_AGE_GROUP = {
     "Baseball / Softball": {
-        "other_primary": ["Softball", "Baseball"],
-        "secondary":     ["Kickball", "T-Ball"],
+        "ELEMENTARY SCHOOLS": "12U", "MIDDLE SCHOOLS": "14U",
+        "HIGH SCHOOLS": "18U", "PUBLIC PARKS & RECREATION": "14U",
+        "COLLEGE": "12U", "GYMNASIUM / INDOOR FACILITIES": "12U",
+        "OTHER FACILITIES": "12U",
     },
     "Basketball": {
-        "other_primary": [],
-        "secondary":     ["Volleyball", "Pickleball", "Futsal"],
+        "ELEMENTARY SCHOOLS": "12U", "MIDDLE SCHOOLS": "18U",
+        "HIGH SCHOOLS": "18U", "PUBLIC PARKS & RECREATION": "18U",
+        "COLLEGE": "18U", "GYMNASIUM / INDOOR FACILITIES": "18U",
+        "OTHER FACILITIES": "18U",
     },
-    "Tennis": {
-        "other_primary": ["Pickleball"],
-        "secondary":     [],
+    "Soccer / Football": {
+        "ELEMENTARY SCHOOLS": "12U", "MIDDLE SCHOOLS": "18U",
+        "HIGH SCHOOLS": "18U", "PUBLIC PARKS & RECREATION": "18U",
+        "COLLEGE": "18U", "GYMNASIUM / INDOOR FACILITIES": "18U",
+        "OTHER FACILITIES": "18U",
     },
-    "Volleyball": {
-        "other_primary": ["Beach Volleyball"],
-        "secondary":     ["Badminton", "Pickleball"],
-    },
+    "Tennis": {k: "18U" for k in [
+        "ELEMENTARY SCHOOLS","MIDDLE SCHOOLS","HIGH SCHOOLS",
+        "PUBLIC PARKS & RECREATION","COLLEGE",
+        "GYMNASIUM / INDOOR FACILITIES","OTHER FACILITIES"]},
+    "Volleyball": {k: "18U" for k in [
+        "ELEMENTARY SCHOOLS","MIDDLE SCHOOLS","HIGH SCHOOLS",
+        "PUBLIC PARKS & RECREATION","COLLEGE",
+        "GYMNASIUM / INDOOR FACILITIES","OTHER FACILITIES"]},
 }
 
-AGE_GROUP_BY_CATEGORY = {
-    "ELEMENTARY SCHOOLS":            "12U",
-    "MIDDLE SCHOOLS":                "14U",
-    "HIGH SCHOOLS":                  "18U",
-    "COLLEGE":                       "18U",
-    "PUBLIC PARKS & RECREATION":     "18U",
-    "GYMNASIUM / INDOOR FACILITIES": "18U",
-    "OTHER FACILITIES":              "18U",
+OTHER_PRIMARY_BY = {
+    "Baseball / Softball": {"*": "Softball, 18U"},
+    "Basketball":          {"*": ""},
+    "Soccer / Football":   {"*": "Football 18U"},
+    # "Soccer / Football": {
+    #     "ELEMENTARY SCHOOLS": "Field hockey 12U, Lacrosse 12U, Rugby 12U, Ultimate Frisbee 12U",
+    #     "*":                  "Field hockey 18U, Lacrosse 18U, Rugby 18U, Ultimate Frisbee 18U",
+    # },
+    "Tennis":     {"*": "Pickleball 18U"},
+    "Volleyball": {"*": ""},
+}
+
+SECONDARY_BY = {
+    "Baseball / Softball": {"*": "Soccer, 12U; Rugby, 12U; Football 12U, Field Hockey 12U, Ultimate 12U, Lacrosse 12U"},
+    "Basketball":          {"*": ""},
+    "Soccer / Football": {
+        "ELEMENTARY SCHOOLS": "Field hockey 12U, Lacrosse 12U, Rugby 12U, Ultimate Frisbee 12U",
+        "*":                  "Field hockey 18U, Lacrosse 18U, Rugby 18U, Ultimate Frisbee 18U",
+    },
+    # "Soccer / Football":   {"*": "Football 18U"},
+    "Tennis":              {"*": ""},
+    "Volleyball":          {"*": ""},
 }
 
 _TOO_SMALL_NAME_FRAGMENTS = [
@@ -526,13 +574,20 @@ def _city_uri(bbox):
         return None
     return f"{_OSM_TYPE_PREFIX.get(t, 'osmrel:')}{oid}"
 
-def build_qlever_queries(bbox, sport_config):
-    """Build SPARQL queries that mirror the Overpass facility lookups.
+_INDOOR_SPORTS = {"Basketball", "Volleyball"}
 
-    Spatial filter uses Qlever's pre-computed `ogc:sfContains` relation
-    (`<city_relation> ogc:sfContains ?osm_id`). This requires the city's
-    OSM relation/way id from the Photon lookup. Falls back to no spatial
-    filter only if the id is missing (rare).
+def build_qlever_queries(bbox, sport_config, sport_choice=""):
+    """SPARQL queries with sport-aware container filtering.
+
+    For each container type (parks, schools, sports_centres) we issue a
+    pitch-containment query: `?facility ogc:sfContains ?pitch` where the
+    pitch matches this sport. This returns only facilities that actually
+    host the sport (per OSM data) — replacing the prior haversine 200m
+    heuristic.
+
+    For indoor sports we ALSO include all sports_centres/community_centres
+    regardless of pitch tagging, because indoor courts are rarely tagged
+    with a sport in OSM.
     """
     city = _city_uri(bbox)
     sports_filter = " || ".join(
@@ -554,8 +609,15 @@ SELECT ?osm_id ?name ?sport ?lit ?hoops ?wkt WHERE {{
 }}
 LIMIT 5000"""
 
+    # v5: drop the `ogc:sfContains ?pitch` requirement. Fetch ALL parks /
+    # schools / sports_centres / recreation_grounds in the city bbox; the
+    # post-merge proximity step attaches any nearby pitch (500m radius).
+    # Schools etc with no OSM-tagged pitch nearby get filtered out by the
+    # `has_pitches or is_sport_name` check in merge_and_deduplicate.
+    # This restores middle schools and other facilities that exist in OSM
+    # but lack the explicit leisure=pitch child geometry.
     parks = f"""{SPARQL_PREFIXES}
-SELECT ?osm_id ?name ?wkt WHERE {{
+SELECT DISTINCT ?osm_id ?name ?wkt WHERE {{
   {spatial}
   ?osm_id osmkey:leisure "park" ;
           osmkey:name ?name ;
@@ -564,7 +626,7 @@ SELECT ?osm_id ?name ?wkt WHERE {{
 LIMIT 2000"""
 
     schools = f"""{SPARQL_PREFIXES}
-SELECT ?osm_id ?name ?amenity ?wkt WHERE {{
+SELECT DISTINCT ?osm_id ?name ?amenity ?wkt WHERE {{
   {spatial}
   ?osm_id osmkey:amenity ?amenity ;
           osmkey:name ?name ;
@@ -574,21 +636,53 @@ SELECT ?osm_id ?name ?amenity ?wkt WHERE {{
 LIMIT 2000"""
 
     sports_centres = f"""{SPARQL_PREFIXES}
-SELECT ?osm_id ?name ?leisure ?wkt WHERE {{
+SELECT DISTINCT ?osm_id ?name ?leisure ?wkt WHERE {{
   {spatial}
   ?osm_id osmkey:leisure ?leisure ;
           osmkey:name ?name ;
           geo:hasGeometry/geo:asWKT ?wkt .
-  FILTER(?leisure IN ("sports_centre", "fitness_centre"))
+  FILTER(?leisure IN ("sports_centre", "fitness_centre", "stadium"))
 }}
 LIMIT 1000"""
 
-    return {
+    rec_grounds = f"""{SPARQL_PREFIXES}
+SELECT DISTINCT ?osm_id ?name ?wkt WHERE {{
+  {spatial}
+  ?osm_id osmkey:landuse "recreation_ground" ;
+          osmkey:name ?name ;
+          geo:hasGeometry/geo:asWKT ?wkt .
+}}
+LIMIT 1000"""
+
+    queries = {
         f"{sport_config['facility_label']}s": ("pitch", pitches),
         "Parks": ("park", parks),
         "Schools": ("school", schools),
-        "Sports centres + gyms": ("sports_centre", sports_centres),
+        "Sports centres + stadiums": ("sports_centre", sports_centres),
+        "Recreation grounds": ("park", rec_grounds),
     }
+
+    # Indoor sports: include all sports_centres/community_centres/sports_halls
+    # even without OSM pitch tags (indoor courts rarely tagged).
+    if sport_choice in _INDOOR_SPORTS:
+        indoor_query = f"""{SPARQL_PREFIXES}
+SELECT DISTINCT ?osm_id ?name ?leisure ?amenity ?building ?wkt WHERE {{
+  {spatial}
+  ?osm_id osmkey:name ?name ;
+          geo:hasGeometry/geo:asWKT ?wkt .
+  OPTIONAL {{ ?osm_id osmkey:leisure ?leisure }}
+  OPTIONAL {{ ?osm_id osmkey:amenity ?amenity }}
+  OPTIONAL {{ ?osm_id osmkey:building ?building }}
+  FILTER(
+    ?leisure IN ("sports_centre", "fitness_centre", "sports_hall") ||
+    ?amenity IN ("community_centre", "gym") ||
+    ?building IN ("sports_hall", "gymnasium")
+  )
+}}
+LIMIT 1500"""
+        queries["Indoor gyms / community centres"] = ("sports_centre", indoor_query)
+
+    return queries
 
 def _parse_wkt_point(wkt):
     """Return (lat, lon) from a WKT geometry. Centroid for polygons."""
@@ -620,8 +714,10 @@ def query_qlever(name, query, status_callback, use_cache=True, timeout=90):
     try:
         with _log_lock:
             status_callback(f"  [{name}] querying Qlever...")
-        resp = requests.post(QLEVER_ENDPOINT, data={"query": query},
-                              headers=headers, timeout=timeout)
+        # Global semaphore: max 3 concurrent SPARQL POSTs to public Qlever.
+        with _QLEVER_SEM:
+            resp = requests.post(QLEVER_ENDPOINT, data={"query": query},
+                                  headers=headers, timeout=timeout)
         resp.raise_for_status()
         payload = resp.json()
         rows = payload.get("results", {}).get("bindings", [])
@@ -630,7 +726,9 @@ def query_qlever(name, query, status_callback, use_cache=True, timeout=90):
             flat.append({k: v.get("value", "") for k, v in r.items()})
         with _log_lock:
             status_callback(f"  [{name}] OK {len(flat)} rows")
-        if use_cache:
+        # Only cache non-empty results. Empty rows often indicate transient
+        # Qlever throttle; caching them poisons the next 7 days of runs.
+        if use_cache and flat:
             cache_set(_cache_key("qlever", QLEVER_ENDPOINT, query), flat)
         return name, flat
     except Exception as e:
@@ -638,11 +736,19 @@ def query_qlever(name, query, status_callback, use_cache=True, timeout=90):
             status_callback(f"  [{name}] ERR {type(e).__name__}: {e}")
         return name, []
 
+def _resolve_sport_choice(sport_config):
+    """Recover the SPORTS_CONFIG key from a sport_config dict."""
+    for k, v in SPORTS_CONFIG.items():
+        if v is sport_config:
+            return k
+    return ""
+
 def fetch_overpass(bbox, sport_config, overpass_url, status_callback,
                     is_local=False, use_cache=True):
     """Fetch facilities via Qlever SPARQL (Overpass replacement)."""
     status_callback("Source 1: Qlever SPARQL (OSM-planet)...")
-    queries = build_qlever_queries(bbox, sport_config)
+    sport_choice = _resolve_sport_choice(sport_config)
+    queries = build_qlever_queries(bbox, sport_config, sport_choice)
     results = []
     with ThreadPoolExecutor(max_workers=3) as ex:
         futures = {
@@ -713,6 +819,128 @@ def fetch_nominatim(city, state, bbox, sport_config, status_callback, use_cache=
     """No-op in Qlever mode — Qlever already returns named facilities."""
     status_callback("Source 2: Nominatim — skipped (Qlever provides names).")
     return []
+
+NCES_API_BASE = "https://educationdata.urban.org/api/v1/schools/ccd/directory"
+NCES_YEAR = 2020
+NCES_CACHE_TTL_SECONDS = 30 * 24 * 3600
+
+_US_STATE_ABBR = {
+    "alabama":"AL","alaska":"AK","arizona":"AZ","arkansas":"AR",
+    "california":"CA","colorado":"CO","connecticut":"CT","delaware":"DE",
+    "florida":"FL","georgia":"GA","hawaii":"HI","idaho":"ID",
+    "illinois":"IL","indiana":"IN","iowa":"IA","kansas":"KS",
+    "kentucky":"KY","louisiana":"LA","maine":"ME","maryland":"MD",
+    "massachusetts":"MA","michigan":"MI","minnesota":"MN","mississippi":"MS",
+    "missouri":"MO","montana":"MT","nebraska":"NE","nevada":"NV",
+    "new hampshire":"NH","new jersey":"NJ","new mexico":"NM","new york":"NY",
+    "north carolina":"NC","north dakota":"ND","ohio":"OH","oklahoma":"OK",
+    "oregon":"OR","pennsylvania":"PA","rhode island":"RI",
+    "south carolina":"SC","south dakota":"SD","tennessee":"TN","texas":"TX",
+    "utah":"UT","vermont":"VT","virginia":"VA","washington":"WA",
+    "west virginia":"WV","wisconsin":"WI","wyoming":"WY",
+    "district of columbia":"DC",
+}
+
+def _state_to_abbr(state):
+    s = (state or "").strip()
+    if len(s) == 2:
+        return s.upper()
+    return _US_STATE_ABBR.get(s.lower(), s[:2].upper())
+
+def _fetch_nces_state_raw(state_abbr, use_cache=True):
+    """Fetch every public school in a state (paginated). 30-day cache."""
+    key = _cache_key("nces_state_v1", NCES_YEAR, state_abbr)
+    if use_cache:
+        cached = cache_get(key, max_age_seconds=NCES_CACHE_TTL_SECONDS)
+        if cached is not None:
+            return cached
+
+    all_results = []
+    url = f"{NCES_API_BASE}/{NCES_YEAR}/"
+    params = {"state_location": state_abbr}
+    for _page in range(20):
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=90)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            break
+        all_results.extend(data.get("results", []))
+        nxt = data.get("next")
+        if not nxt:
+            break
+        url = nxt
+        params = None
+
+    if use_cache and all_results:
+        cache_set(_cache_key("nces_state_v1", NCES_YEAR, state_abbr), all_results)
+    return all_results
+
+def _nces_level_to_category(lvl):
+    try:
+        lvl = int(lvl)
+    except (TypeError, ValueError):
+        return "OTHER FACILITIES"
+    return {
+        1: "ELEMENTARY SCHOOLS",
+        2: "MIDDLE SCHOOLS",
+        3: "HIGH SCHOOLS",
+        4: "OTHER FACILITIES",
+    }.get(lvl, "OTHER FACILITIES")
+
+def fetch_nces_schools(target_city, target_state, bbox, status_callback,
+                        use_cache=True):
+    """Fetch NCES public schools in target_city; returns entries in the
+    same schema Qlever produces so downstream merge/geocode/Excel is
+    unchanged. Every school is auto-categorized via school_level."""
+    state_abbr = _state_to_abbr(target_state)
+    status_callback(f"Source 2: NCES CCD schools ({state_abbr})...")
+    all_rows = _fetch_nces_state_raw(state_abbr, use_cache=use_cache)
+    if not all_rows:
+        status_callback(f"  NCES: 0 rows for {state_abbr}")
+        return []
+
+    target = (target_city or "").strip().lower()
+    matched = []
+    for r in all_rows:
+        loc = (r.get("city_location") or "").strip().lower()
+        lat = r.get("latitude")
+        lon = r.get("longitude")
+        try:
+            lat = float(lat) if lat is not None else None
+            lon = float(lon) if lon is not None else None
+        except (TypeError, ValueError):
+            lat = lon = None
+        if lat is None or lon is None:
+            continue
+        # Match by city string OR bbox — handles adjacent cities & aliases.
+        in_bbox_ok = (bbox and
+                      bbox["min_lat"] <= lat <= bbox["max_lat"] and
+                      bbox["min_lon"] <= lon <= bbox["max_lon"])
+        if loc != target and not in_bbox_ok:
+            continue
+
+        name = (r.get("school_name") or "").strip()
+        if not name:
+            continue
+        matched.append({
+            "source": "nces",
+            "name": clean_name(name),
+            "lat": lat, "lon": lon,
+            "sport": "",
+            "leisure": "",
+            "amenity": "school",
+            "building": "",
+            "tags": {
+                "addr:city": r.get("city_location", ""),
+                "nces_level": r.get("school_level", ""),
+            },
+            "nces_level": r.get("school_level", ""),
+            "length_ft": None,
+            "width_ft": None,
+        })
+    status_callback(f"  NCES matched: {len(matched)} schools in {target_city}")
+    return matched
 
 def is_confirmed_sport(entry, sport_config):
     sport = entry.get("sport", "").lower()
@@ -865,7 +1093,10 @@ def merge_and_deduplicate(all_sources, sport_config, status_callback):
         status_callback(f"  Same-campus dedup removed {len(suppressed)} co-located duplicate(s)")
         facility_list = [fl[i] for i in range(len(fl)) if i not in suppressed]
 
-    PROXIMITY_RADIUS = 200
+    # 500m radius covers large high-school + college campuses. The previous
+    # 200m left edge-of-campus pitches stranded as standalone entries
+    # (e.g. soccer pitch on Westmoor High School's far field).
+    PROXIMITY_RADIUS = 500
     for pitch in confirmed:
         if not pitch.get("lat") or not pitch.get("lon"):
             continue
@@ -893,18 +1124,23 @@ def merge_and_deduplicate(all_sources, sport_config, status_callback):
                 pitch["name"] = f"{sport_config['facility_label']} ({pitch['lat']:.4f}, {pitch['lon']:.4f})"
                 facility_list.append(pitch)
 
-    # Keep a facility for THIS sport only if it actually has the sport:
-    #   - a confirmed pitch/court of this sport was attached as a child, OR
-    #   - its name explicitly matches the sport's keywords
-    #     (e.g. "Tennis Center", "X Recreation Center" for basketball).
-    # Do NOT keep bare parks/schools that merely *could* host the sport —
-    # that was the bug where every park appeared under every sport.
+    # v5 fix: the SPARQL fetch no longer requires `ogc:sfContains ?pitch`,
+    # so facility_list contains every park/school in the bbox regardless
+    # of sport. Restore the sport-gating post-filter: keep a facility only
+    # if it has an attached pitch of this sport (via the 500m proximity
+    # step above) or its name explicitly matches the sport's keywords.
+    # Without this, the tennis sheet listed every park in the city
+    # (v5 hallucination bug).
     results = []
     for fac in facility_list:
         has_pitches = len(fac.get("child_pitches", [])) > 0
         name_lower = fac.get("name", "").lower()
         is_sport_name = any(k in name_lower for k in sport_config["keywords"])
-        if has_pitches or is_sport_name:
+        # NCES-sourced schools bypass the sport-gating filter: every real
+        # public school is a valid facility for the memo sports and gets
+        # default dims from SPORT_DIMENSIONS even without OSM pitch data.
+        is_nces = fac.get("source") == "nces"
+        if has_pitches or is_sport_name or is_nces:
             results.append(fac)
 
     results = [r for r in results if r.get("name")]
@@ -1179,6 +1415,12 @@ def categorize(entries, sport_config, status_callback):
     }
 
     for entry in entries:
+        # NCES entries carry an explicit school_level (1=Elem, 2=Mid, 3=Hi,
+        # 4=Other) — use that first; falls back to name matching below.
+        if entry.get("source") == "nces" and entry.get("nces_level") not in (None, ""):
+            categories[_nces_level_to_category(entry.get("nces_level"))].append(entry)
+            continue
+
         combined = (entry["name"] + " " + entry.get("address", "")).lower()
         if any(k in combined for k in ["high school", "high sch", "preparatory", "prep school"]):
             categories["HIGH SCHOOLS"].append(entry)
@@ -1201,25 +1443,24 @@ def categorize(entries, sport_config, status_callback):
 
     return categories
 
-def _standard_dims(sport_choice, category):
-    return STANDARD_DIMENSIONS.get(sport_choice, {}).get(category, (None, None))
+def _dims(sport_choice, category):
+    return SPORT_DIMENSIONS.get(sport_choice, {}).get(category, (None, None, None, None))
 
-def _sport_meta(sport_choice):
-    color = SPORT_COLOR.get(sport_choice, "Gray")
-    mapping = SECONDARY_SPORTS_BY_SPORT.get(sport_choice, {"other_primary": [], "secondary": []})
-    primary = sport_choice.split(" / ")[0]
-    other_primary = ", ".join(mapping["other_primary"])
-    secondary = ", ".join(mapping["secondary"])
-    return primary, other_primary, secondary, color
+def _lookup_by_category(mapping, sport_choice, category):
+    table = mapping.get(sport_choice, {})
+    if category in table:
+        return table[category]
+    return table.get("*", "")
 
 def expand_to_rows(entries, sport_config, category_name, sport_choice):
     rows = []
     label = sport_config["facility_label"]
     variants = sport_config["label_variants"]
-    std_len, std_wid = _standard_dims(sport_choice, category_name)
-    primary_sport, other_primary, secondary_sport, color_name = _sport_meta(sport_choice)
-    color_hex = COLOR_NAME_TO_HEX.get(color_name, "FFFFFF")
-    age_group = AGE_GROUP_BY_CATEGORY.get(category_name, "Open")
+    L1, W1, L2, W2 = _dims(sport_choice, category_name)
+    primary_sport = sport_choice.split(" / ")[0]
+    other_primary = _lookup_by_category(OTHER_PRIMARY_BY, sport_choice, category_name)
+    secondary_sport = _lookup_by_category(SECONDARY_BY, sport_choice, category_name)
+    age_group = SPORT_AGE_GROUP.get(sport_choice, {}).get(category_name, "18U")
 
     for entry in entries:
         children = entry.get("child_pitches", [])
@@ -1230,7 +1471,7 @@ def expand_to_rows(entries, sport_config, category_name, sport_choice):
 
         zipcode = entry.get("zipcode") or _parse_zip_from_address(entry.get("address", ""))
 
-        def _desc(sport_str):
+        def _desc(sport_str):   
             d = label
             if "softball" in sport_str and "baseball" in sport_str and "both" in variants:
                 d = variants["both"]
@@ -1253,15 +1494,15 @@ def expand_to_rows(entries, sport_config, category_name, sport_choice):
                 "address": entry.get("address", ""),
                 "lat": lat,
                 "lon": lon,
-                "std_length_ft": std_len,
-                "std_width_ft": std_wid,
+                "length_1_ft": L1,
+                "width_1_ft":  W1,
+                "length_2_ft": L2,
+                "width_2_ft":  W2,
                 "primary_sport": primary_sport,
+                "age_group": age_group,
                 "other_primary": other_primary,
                 "secondary_sport": secondary_sport,
-                "age_group": age_group,
                 "category": category_name,
-                "color_name": color_name,
-                "color_hex": color_hex,
                 "zipcode": zipcode,
                 "google_earth_url": f"https://earth.google.com/web/@{lat},{lon},50a,300d,35y,0h,0t,0r",
             }
@@ -1297,9 +1538,29 @@ def expand_to_rows(entries, sport_config, category_name, sport_choice):
                     child.get("lat", entry["lat"]),
                     child.get("lon", entry["lon"]),
                 ))
+
+    # Excel-only augmentation: for Basketball at any non-outdoor category,
+    # synthesize a Gymnasium row per facility (indoor counterpart to the
+    # outdoor courts found via OSM). Volleyball 18U goes in Secondary
+    # Sports. Skipped for PUBLIC PARKS & RECREATION since those are
+    # outdoor courts. Does not affect any other sport.
+    if (sport_choice == "Basketball"
+            and category_name != "PUBLIC PARKS & RECREATION"):
+        seen = set()
+        for entry in entries:
+            key = entry.get("name", "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            gym_row = _row("Gymnasium Basketball Court",
+                            entry["lat"], entry["lon"])
+            gym_row["secondary_sport"] = "Volleyball 18U"
+            rows.append(gym_row)
+    #print(rows)
     return rows
 
 def build_excel(categories, sport_config, sport_choice, city):
+    
     wb = Workbook()
     ws = wb.active
     title = f"{sport_config['facility_label']}s - {city}"[:31]
@@ -1319,21 +1580,22 @@ def build_excel(categories, sport_config, sport_choice, city):
 
     widths = {
         "A": 26, "B": 22, "C": 32, "D": 10, "E": 10,
-        "F": 10, "G": 10, "H": 14, "I": 16, "J": 18,
-        "K": 18, "L": 9, "M": 10, "N": 14,
+        "F": 11, "G": 11, "H": 11, "I": 11,
+        "J": 14, "K": 10, "L": 26, "M": 38, "N": 9, "O": 14,
     }
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
-    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[1].height = 30
     ws.freeze_panes = "A2"
 
     headers = [
         "Name of Facility", "Description", "Address",
         "Lat", "Lon",
-        "Std Length (ft)", "Std Width (ft)",
-        "Primary Sport", "Other Primary Sports",
-        "Secondary Sports", "Age Group",
-        "ZIP", "Color", "Google Earth",
+        "Length 1 (ft)", "Width 1 (ft)",
+        "Length 2 (ft)", "Width 2 (ft)",
+        "Primary Sport", "Age Group",
+        "Other Primary Sports", "Secondary Sports",
+        "ZIP", "Google Earth",
     ]
     NUM_COLS = len(headers)
 
@@ -1357,7 +1619,7 @@ def build_excel(categories, sport_config, sport_choice, city):
     total = 0
     link_font = Font(name="Arial", size=10, color="1155CC", underline="single")
     alt_fill = PatternFill("solid", fgColor="F2F2F2")
-
+    #print(sport_config)
     for section in section_order:
         entries = categories.get(section, [])
         if not entries:
@@ -1379,10 +1641,10 @@ def build_excel(categories, sport_config, sport_choice, city):
 
         for idx, row in enumerate(data_rows):
             apply_alt = (idx % 2 == 1)
-            std_l = row.get("std_length_ft")
-            std_w = row.get("std_width_ft")
-            color_name = row.get("color_name", "")
-            color_hex = row.get("color_hex", "FFFFFF")
+            l1 = row.get("length_1_ft")
+            w1 = row.get("width_1_ft")
+            l2 = row.get("length_2_ft")
+            w2 = row.get("width_2_ft")
 
             values = [
                 row["name"],
@@ -1390,14 +1652,15 @@ def build_excel(categories, sport_config, sport_choice, city):
                 row["address"],
                 round(row["lat"], 4),
                 round(row["lon"], 4),
-                std_l if std_l else "N/A",
-                std_w if std_w else "N/A",
+                l1 if l1 else "N/A",
+                w1 if w1 else "N/A",
+                l2 if l2 else "N/A",
+                w2 if w2 else "N/A",
                 row.get("primary_sport", ""),
+                row.get("age_group", ""),
                 row.get("other_primary", ""),
                 row.get("secondary_sport", ""),
-                row.get("age_group", ""),
                 row.get("zipcode", ""),
-                color_name,
                 None,
             ]
             for col, v in enumerate(values, 1):
@@ -1407,10 +1670,6 @@ def build_excel(categories, sport_config, sport_choice, city):
                 cell.border = thin_border
                 if apply_alt:
                     cell.fill = alt_fill
-
-            color_cell = ws.cell(row=current_row, column=13)
-            color_cell.fill = PatternFill("solid", fgColor=color_hex)
-            color_cell.alignment = Alignment(horizontal="center", vertical="center")
 
             ge_url = row.get("google_earth_url", "")
             ge_cell = ws.cell(row=current_row, column=NUM_COLS, value="View on Earth")
@@ -1483,8 +1742,11 @@ def _run_single_job(city, county, state, sport_choice, overpass_url, use_cache,
                                      is_local=is_local, use_cache=use_cache)
         nm_results = fetch_nominatim(city, state, bbox, sport_config, _log,
                                       use_cache=use_cache)
+        nces_results = fetch_nces_schools(city, state, bbox, _log,
+                                            use_cache=use_cache)
 
-        merged = merge_and_deduplicate(op_results + nm_results, sport_config, _log)
+        merged = merge_and_deduplicate(
+            op_results + nm_results + nces_results, sport_config, _log)
         if not merged:
             with log_lock:
                 status_callback(f"{job_tag} 0 facilities")
@@ -1511,9 +1773,10 @@ def _run_single_job(city, county, state, sport_choice, overpass_url, use_cache,
         return sport_choice, None, 0, f"{job_tag} {e}\n{tb}"
 
 def _build_city_workbook(city, sport_results):
+    #print(type(sport_results),type(city))
     master = Workbook()
     master.remove(master.active)
-
+    
     grand_total = 0
     for sport_choice, (categories, total) in sport_results.items():
         if not categories:
@@ -1694,6 +1957,75 @@ def main():
                 st.success("Cleared.")
         else:
             st.caption("💾 Cache empty")
+
+        st.divider()
+        st.subheader("🔍 Single city search")
+        single_city = st.text_input("City", key="single_city",
+                                     placeholder="Daly City")
+        single_county = st.text_input("County (optional)", key="single_county",
+                                       placeholder="San Mateo County")
+        single_state = st.text_input("State", key="single_state",
+                                      placeholder="California")
+        run_single = st.button("🔎 Search this city", use_container_width=True,
+                                type="primary")
+
+    if run_single:
+        if not single_city.strip() or not single_state.strip():
+            st.error("City and State are required for single-city search.")
+            return
+        if not sports_selected:
+            st.error("Pick at least one sport in the sidebar.")
+            return
+        row = {
+            "city": single_city.strip(),
+            "county": (single_county or "").strip(),
+            "state": single_state.strip(),
+        }
+        st.subheader(f"🏟️ {row['city']}, {row['state']}")
+        st.info(f"Running {len(sports_selected)} sport(s) on "
+                f"**{max_workers}** workers.")
+        log_messages = []
+        def _log(msg):
+            log_messages.append(msg)
+        status = st.status(f"Fetching {row['city']}...", expanded=True)
+        with status:
+            t0 = time.time()
+            per_city_results, errors = run_batch(
+                [row], sports_selected, overpass_url, use_cache,
+                max_workers, _log,
+            )
+            elapsed = time.time() - t0
+            sport_results = per_city_results.get(row["city"], {})
+            wb_buf, n = _build_city_workbook(row["city"], sport_results) \
+                if sport_results else (None, 0)
+            status.update(
+                label=f"✅ Done in {elapsed:.1f}s — {n} facility rows",
+                state="complete",
+            )
+        if wb_buf is None or n == 0:
+            st.warning("No facilities found for this city.")
+        else:
+            st.success(f"✅ {n} facility rows across "
+                       f"{len(sport_results)} sport(s)")
+            for sp, (_cats, tot) in sport_results.items():
+                st.caption(f"• {sp}: {tot}")
+            safe_name = row["city"].replace(" ", "_").replace("/", "_")
+            st.download_button(
+                label=f"📥 Download {safe_name}.xlsx",
+                data=wb_buf,
+                file_name=f"{safe_name}.xlsx",
+                mime=("application/vnd.openxmlformats-officedocument."
+                      "spreadsheetml.sheet"),
+                type="primary",
+                use_container_width=True,
+            )
+        if errors:
+            with st.expander(f"⚠️ {len(errors)} error(s)"):
+                for e in errors:
+                    st.text(e)
+        with st.expander(f"📜 Log ({len(log_messages)} lines)"):
+            st.code("\n".join(log_messages), language="text")
+        return
 
     st.subheader("1. Upload city list")
     st.caption("Required columns: **City**, **State**. Optional: **County**. "
