@@ -144,9 +144,6 @@ def cache_set(key, value):
                 (key, json.dumps(value), int(time.time())),
             )
 
-def _cache_set_with_ttl(key, value, ttl_seconds):
-    cache_set(key, value)
-
 def cache_clear():
     with _cache_lock:
         with sqlite3.connect(CACHE_DB_PATH) as conn:
@@ -355,27 +352,6 @@ def clean_name(name):
         return ""
     return re.sub(r"\s+", " ", name).strip()
 
-def meters_to_feet(m):
-    return round(m * 3.28084)
-
-def calc_dimensions_from_bounds(bounds):
-    if not bounds:
-        return None, None
-    min_lat = bounds.get("minlat")
-    max_lat = bounds.get("maxlat")
-    min_lon = bounds.get("minlon")
-    max_lon = bounds.get("maxlon")
-    if not all([min_lat, max_lat, min_lon, max_lon]):
-        return None, None
-    ns = haversine(min_lat, min_lon, max_lat, min_lon)
-    mid_lat = (min_lat + max_lat) / 2
-    ew = haversine(mid_lat, min_lon, mid_lat, max_lon)
-    length_ft = meters_to_feet(max(ns, ew))
-    width_ft = meters_to_feet(min(ns, ew))
-    if length_ft < 10 or length_ft > 2000:
-        return None, None
-    return length_ft, width_ft
-
 def normalize_key(name):
     n = name.lower().strip()
     for suffix in [" park", " field", " fields", " court", " courts"]:
@@ -486,24 +462,6 @@ def lookup_city_bbox(city, county, state="California", country="USA", use_cache=
         cache_set(key, result)
     return result
 
-def _extract_polygon_points(geojson):
-    geom_type = geojson.get("type", "")
-    coords = geojson.get("coordinates", [])
-    points = []
-    try:
-        if geom_type == "Polygon":
-            for lon, lat in coords[0]:
-                points.append((lat, lon))
-        elif geom_type == "MultiPolygon":
-            for poly in coords:
-                for lon, lat in poly[0]:
-                    points.append((lat, lon))
-        else:
-            return None
-    except (IndexError, TypeError, ValueError):
-        return None
-    return points if len(points) >= 3 else None
-
 def point_in_polygon(lat, lon, polygon):
     if not polygon or len(polygon) < 3:
         return True
@@ -518,10 +476,6 @@ def point_in_polygon(lat, lon, polygon):
             inside = not inside
         j = i
     return inside
-
-def in_bbox(lat, lon, bbox):
-    return (bbox["min_lat"] <= lat <= bbox["max_lat"] and
-            bbox["min_lon"] <= lon <= bbox["max_lon"])
 
 class OverpassCircuitBreaker:
     def __init__(self):
@@ -1471,7 +1425,7 @@ def expand_to_rows(entries, sport_config, category_name, sport_choice):
 
         zipcode = entry.get("zipcode") or _parse_zip_from_address(entry.get("address", ""))
 
-        def _desc(sport_str):   
+        def _desc(sport_str):
             d = label
             if "softball" in sport_str and "baseball" in sport_str and "both" in variants:
                 d = variants["both"]
@@ -1556,11 +1510,60 @@ def expand_to_rows(entries, sport_config, category_name, sport_choice):
                             entry["lat"], entry["lon"])
             gym_row["secondary_sport"] = "Volleyball 18U"
             rows.append(gym_row)
-    #print(rows)
     return rows
 
-def build_excel(categories, sport_config, sport_choice, city):
+def build_json(sport_results, city, state):
+    # I need to recover
+    # FacilityName FacilityCity FacilityCounty FieldName Length Width BaseballLength BaseballWidth FieldType Latitude Longitude ImageLink
+    # the other feilds in the JSON are either going to be blank or are unknowable without data we do not have access to here
+    # expand_to_rows # use this to extract the data I want
+
+    #sample = "{'FacilityId':'NA','FacilityName':'NA','FacilityCity':'NA','FacilityCounty':'NA','CreatedUser':'NA','CreateDate':'NA'," \
+    #"'ReviewedByUser','ReviewedByDate','ReviewCompleted'," \
+    #"'FieldId':'NA','FieldName':'NA','Length':'NA','Width':'NA','BaseballLength':'NA','BaseballWidth':'NA','FieldType':'NA','Latitude':'NA'," \
+    #"'Longitude':'NA',ImageLink':'NA'}"
+    # in the above CreatedUser, ReviewedByUser, ReviewedByDate, ReviewCompleted, FieldId, FacilityId
     
+    output_frame = pd.DataFrame()
+    section_order = [
+            "PUBLIC PARKS & RECREATION",
+            "GYMNASIUM / INDOOR FACILITIES",
+            "HIGH SCHOOLS",
+            "MIDDLE SCHOOLS",
+            "ELEMENTARY SCHOOLS",
+            "COLLEGE",
+            "OTHER FACILITIES",
+        ]
+    for sport_choice, (categories, total) in sport_results.items():
+        if not categories:
+            continue
+        sport_config = SPORTS_CONFIG[sport_choice]
+        for section in section_order:
+            entries = categories.get(section, [])
+            data_rows = expand_to_rows(entries, sport_config, section, sport_choice)
+            df = pd.DataFrame(data_rows)
+            df = df.rename(columns=
+                           {"lat": "Latitude", "lon": "Longitude",
+                            "length_1_ft": "Length", "width_1_ft": "Width",
+                            "length_2_ft": "BaseballLength", "width_2_ft": "BaseballWidth",
+                            "google_earth_url": "ImageLink", "name": "FacilityName"})
+            
+            try:
+                output_frame = pd.concat([output_frame, df], ignore_index=True)
+                print(output_frame)
+            except:
+                output_frame = df
+            #output_json.update(json.load(data_rows))
+    output_frame['city'] = city
+    output_frame['county'] = ""
+    output_frame['state'] = state
+    #print(output_json)
+    #output_json = json.loads(api_response_string)
+    output_frame.to_json('data.json', orient='records', indent=4)
+    return output_frame
+
+
+def build_excel(categories, sport_config, sport_choice, city):
     wb = Workbook()
     ws = wb.active
     title = f"{sport_config['facility_label']}s - {city}"[:31]
@@ -1619,7 +1622,7 @@ def build_excel(categories, sport_config, sport_choice, city):
     total = 0
     link_font = Font(name="Arial", size=10, color="1155CC", underline="single")
     alt_fill = PatternFill("solid", fgColor="F2F2F2")
-    #print(sport_config)
+
     for section in section_order:
         entries = categories.get(section, [])
         if not entries:
@@ -1773,10 +1776,9 @@ def _run_single_job(city, county, state, sport_choice, overpass_url, use_cache,
         return sport_choice, None, 0, f"{job_tag} {e}\n{tb}"
 
 def _build_city_workbook(city, sport_results):
-    #print(type(sport_results),type(city))
     master = Workbook()
     master.remove(master.active)
-    
+
     grand_total = 0
     for sport_choice, (categories, total) in sport_results.items():
         if not categories:
@@ -1887,6 +1889,7 @@ def run_batch(rows, sports_selected, overpass_url, use_cache, max_workers,
     return results, errors
 
 def _build_zip(per_city_results, status_callback):
+    #print(per_city_results)
     buf = io.BytesIO()
     grand_total = 0
     cities_with_data = 0
@@ -1996,6 +1999,7 @@ def main():
             )
             elapsed = time.time() - t0
             sport_results = per_city_results.get(row["city"], {})
+            build_json(sport_results, row['city'], row['state'])
             wb_buf, n = _build_city_workbook(row["city"], sport_results) \
                 if sport_results else (None, 0)
             status.update(
